@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//
+// Replace a per-iteration __jacc_check with one __jacc_check_span in
+// the loop preheader, when the address is an affine function of the
+// induction variable and the trip count is known.
+//
+//   for (i = 0; i < n; i++) s += a[i];
+//
+// has a check on a + 8*i in every iteration. SCEV says that address
+// runs a, a+8, ... a+8*(n-1), so the loop only needs the two end
+// points checked against a's object, once, before it starts.
+//
+// Only touches loops where:
+//   - the one exit is the latch (rotated, do-while shape), so a block
+//     that dominates the latch runs exactly BTC+1 times and the
+//     preheader is only reached when the body runs at least once;
+//   - the check block dominates the latch;
+//   - nothing in the loop can unwind or exit the process early,
+//     otherwise the hoisted check could trap on an iteration the
+//     program would never have reached.
+// Hoisting still makes the trap earlier than it used to be. With
+// -jacc-precise-traps we refuse to hoist past any call at all.
+
+#include "JaccCommon.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+
+using namespace llvm;
+using namespace jacc;
+
+static cl::opt<bool> Verbose("jacc-verbose", cl::init(false),
+			     cl::desc("report hoisted bounds checks"));
+static cl::opt<bool> PreciseTraps("jacc-precise-traps", cl::init(false),
+				  cl::desc("never hoist a check past a call"));
+
+static bool no(const char *why)
+{
+	if (Verbose)
+		errs() << "jacc:   not hoisted: " << why << "\n";
+	return false;
+}
+
+static bool isCheck(const CallBase *CB)
+{
+	const Function *F = CB->getCalledFunction();
+	return F && F->getName() == "__jacc_check";
+}
+
+static bool loopIsStraightforward(Loop *L)
+{
+	if (!L->getLoopPreheader() || !L->getLoopLatch())
+		return false;
+	if (L->getExitingBlock() != L->getLoopLatch())
+		return false;
+
+	for (BasicBlock *BB : L->blocks()) {
+		for (Instruction &I : *BB) {
+			auto *CB = dyn_cast<CallBase>(&I);
+			if (!CB)
+				continue;
+			const Function *F = CB->getCalledFunction();
+			if (F && isRuntimeName(F->getName()))
+				continue;
+			if (PreciseTraps)
+				return false;
+			if (!CB->doesNotThrow() || !CB->willReturn())
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * SCEV can't prove that 8*i doesn't overflow when n is an arbitrary
+ * i64, and we can't either. What we do know is that the access which
+ * follows the check goes through inbounds GEPs and runs every time the
+ * check does. An inbounds GEP that leaves its object is undefined, so
+ * if the offset were to wrap, the program was already broken and we
+ * are free to assume it doesn't.
+ */
+static bool wrapIsUB(CallInst *CI, Value *P, Value *Base)
+{
+	for (Value *V = P; V != Base;) {
+		auto *G = dyn_cast<GetElementPtrInst>(V);
+		if (!G || !G->isInBounds())
+			return false;
+		V = G->getPointerOperand();
+	}
+
+	for (Instruction *I = CI->getNextNode(); I; I = I->getNextNode()) {
+		if (auto *L = dyn_cast<LoadInst>(I))
+			if (L->getPointerOperand() == P)
+				return true;
+		if (auto *S = dyn_cast<StoreInst>(I))
+			if (S->getPointerOperand() == P)
+				return true;
+		if (auto *CB = dyn_cast<CallBase>(I)) {
+			const Function *F = CB->getCalledFunction();
+			if (!(F && isRuntimeName(F->getName())) &&
+			    !isGuaranteedToTransferExecutionToSuccessor(I))
+				return false;
+		}
+	}
+	return false;
+}
+
+static bool widen(CallInst *CI, Loop *L, ScalarEvolution &SE, DominatorTree &DT,
+		  const DataLayout &DL)
+{
+	Value *Base = CI->getArgOperand(0);
+	Value *P = CI->getArgOperand(1);
+	Value *N = CI->getArgOperand(2);
+
+	if (!L->isLoopInvariant(Base) || !L->isLoopInvariant(N))
+		return no("base or size not invariant");
+	if (!DT.dominates(CI->getParent(), L->getLoopLatch()))
+		return no("check does not dominate latch");
+
+	const SCEV *BTC = SE.getBackedgeTakenCount(L);
+	if (isa<SCEVCouldNotCompute>(BTC))
+		return no("trip count unknown");
+
+	// work on the integer offset from the base, so we can sum it up
+	// without SCEV getting confused about pointer arithmetic
+	const SCEV *PS = SE.getSCEV(P);
+	const SCEV *PBase = SE.getPointerBase(PS);
+	auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getMinusSCEV(PS, PBase));
+	if (!AR || AR->getLoop() != L || !AR->isAffine())
+		return no("address is not affine in this loop");
+	if (!wrapIsUB(CI, P, Base))
+		return no("can't show wrapping would be undefined");
+
+	const SCEV *Step = AR->getStepRecurrence(SE);
+	const SCEV *FirstOff = AR->getStart();
+	const SCEV *LastOff = AR->evaluateAtIteration(BTC, SE);
+	if (isa<SCEVCouldNotCompute>(LastOff))
+		return no("last address unknown");
+
+	const SCEV *LoOff, *HiOff;
+	if (SE.isKnownNonNegative(Step)) {
+		LoOff = FirstOff;
+		HiOff = LastOff;
+	} else if (SE.isKnownNegative(Step)) {
+		LoOff = LastOff;
+		HiOff = FirstOff;
+	} else {
+		return no("step sign unknown");
+	}
+	const SCEV *Lo = SE.getAddExpr(PBase, LoOff);
+	const SCEV *Hi = SE.getAddExpr(PBase, HiOff);
+
+	BasicBlock *Pre = L->getLoopPreheader();
+	Instruction *At = Pre->getTerminator();
+	SCEVExpander Exp(SE, DL, "jacc.widen");
+	if (!Exp.isSafeToExpandAt(Lo, At) || !Exp.isSafeToExpandAt(Hi, At))
+		return no("bounds not expandable in preheader");
+
+	Type *PtrTy = P->getType();
+	Value *LoV = Exp.expandCodeFor(Lo, PtrTy, At);
+	Value *HiV = Exp.expandCodeFor(Hi, PtrTy, At);
+
+	IRBuilder<> B(At);
+	B.CreateCall(getSpanFn(*CI->getModule()), {Base, LoV, HiV, N});
+	CI->eraseFromParent();
+	return true;
+}
+
+PreservedAnalyses jacc::LoopWidenPass::run(Function &F, FunctionAnalysisManager &AM)
+{
+	auto &LI = AM.getResult<LoopAnalysis>(F);
+	auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+	auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+	const DataLayout &DL = F.getParent()->getDataLayout();
+	unsigned hoisted = 0, seen = 0;
+
+	// preorder reversed: inner loops before the loops around them
+	auto loops = LI.getLoopsInPreorder();
+	for (auto it = loops.rbegin(); it != loops.rend(); ++it) {
+		Loop *L = *it;
+		SmallVector<CallInst *, 8> checks;
+
+		if (!loopIsStraightforward(L))
+			continue;
+		for (BasicBlock *BB : L->blocks()) {
+			if (LI.getLoopFor(BB) != L)
+				continue;
+			for (Instruction &I : *BB)
+				if (auto *CI = dyn_cast<CallInst>(&I))
+					if (isCheck(CI))
+						checks.push_back(CI);
+		}
+		for (CallInst *CI : checks) {
+			seen++;
+			if (widen(CI, L, SE, DT, DL))
+				hoisted++;
+		}
+	}
+
+	if (Verbose && seen)
+		errs() << "jacc: " << F.getName() << ": hoisted " << hoisted
+		       << " of " << seen << " loop checks\n";
+	if (!hoisted)
+		return PreservedAnalyses::all();
+
+	PreservedAnalyses PA;
+	PA.preserveSet<CFGAnalyses>();
+	return PA;
+}
