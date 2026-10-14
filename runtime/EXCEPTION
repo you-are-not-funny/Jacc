@@ -1,0 +1,16 @@
+Jacc runtime exception
+
+Files under runtime/ (lowfat.h, jalloc.h, jalloc.c) are covered by
+GPL-2.0-only (see ../COPYING) with the following additional permission.
+
+You may compile, link, and distribute your own programs together with
+the unmodified or modified Jacc runtime, in source or binary form, without
+those programs having to be licensed under the GPL, provided that your
+program is not itself a compiler, allocator, or sanitizer runtime derived
+from Jacc.
+
+Changes you make to the runtime files themselves are NOT covered by this
+permission. If you distribute a modified runtime, those changes must be
+released under the GPL as described in COPYING, with this exception intact.
+
+SPDX-License-Identifier: GPL-2.0-only WITH Jacc-runtime-exception
