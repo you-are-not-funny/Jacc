@@ -26,12 +26,16 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+
+#include <cstdlib>
 
 using namespace llvm;
 using namespace jacc;
@@ -41,17 +45,31 @@ static cl::opt<bool> Verbose("jacc-verbose", cl::init(false),
 static cl::opt<bool> PreciseTraps("jacc-precise-traps", cl::init(false),
 				  cl::desc("never hoist a check past a call"));
 
+// the cl::opt isn't reachable through clang (plugins load after option
+// parsing), so the environment works too
+static bool verbose()
+{
+	return Verbose || getenv("JACC_VERBOSE");
+}
+
 static bool no(const char *why)
 {
-	if (Verbose)
+	if (verbose())
 		errs() << "jacc:   not hoisted: " << why << "\n";
 	return false;
 }
 
-static bool isCheck(const CallBase *CB)
+// 0: not a loop-hoistable check, 1: heap check, 2: stack/global check
+static int checkKind(const CallBase *CB)
 {
 	const Function *F = CB->getCalledFunction();
-	return F && F->getName() == "__jacc_check";
+	if (!F)
+		return 0;
+	if (F->getName() == "__jacc_check")
+		return 1;
+	if (F->getName() == "__jacc_check_known")
+		return 2;
+	return 0;
 }
 
 static bool loopIsStraightforward(Loop *L)
@@ -113,13 +131,15 @@ static bool wrapIsUB(CallInst *CI, Value *P, Value *Base)
 }
 
 static bool widen(CallInst *CI, Loop *L, ScalarEvolution &SE, DominatorTree &DT,
-		  const DataLayout &DL)
+		  LoopInfo &LI, const DataLayout &DL, bool &Guarded)
 {
 	Value *Base = CI->getArgOperand(0);
 	Value *P = CI->getArgOperand(1);
 	Value *N = CI->getArgOperand(2);
+	Value *Size = checkKind(CI) == 2 ? CI->getArgOperand(3) : nullptr;
 
-	if (!L->isLoopInvariant(Base) || !L->isLoopInvariant(N))
+	if (!L->isLoopInvariant(Base) || !L->isLoopInvariant(N) ||
+	    (Size && !L->isLoopInvariant(Size)))
 		return no("base or size not invariant");
 	if (!DT.dominates(CI->getParent(), L->getLoopLatch()))
 		return no("check does not dominate latch");
@@ -135,10 +155,14 @@ static bool widen(CallInst *CI, Loop *L, ScalarEvolution &SE, DominatorTree &DT,
 	auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getMinusSCEV(PS, PBase));
 	if (!AR || AR->getLoop() != L || !AR->isAffine())
 		return no("address is not affine in this loop");
-	if (!wrapIsUB(CI, P, Base))
-		return no("can't show wrapping would be undefined");
+	// -fwrapv turns inbounds GEPs into plain ones, so often all we have
+	// is "it might wrap". Then we guard the trip count at runtime below.
+	bool needGuard = !wrapIsUB(CI, P, Base);
 
 	const SCEV *Step = AR->getStepRecurrence(SE);
+	auto *StepC = dyn_cast<SCEVConstant>(Step);
+	if (needGuard && !StepC)
+		return no("variable stride and can't show wrapping is undefined");
 	const SCEV *FirstOff = AR->getStart();
 	const SCEV *LastOff = AR->evaluateAtIteration(BTC, SE);
 	if (isa<SCEVCouldNotCompute>(LastOff))
@@ -163,12 +187,35 @@ static bool widen(CallInst *CI, Loop *L, ScalarEvolution &SE, DominatorTree &DT,
 	if (!Exp.isSafeToExpandAt(Lo, At) || !Exp.isSafeToExpandAt(Hi, At))
 		return no("bounds not expandable in preheader");
 
+	/*
+	 * No UB to lean on, so make sure step*BTC can't wrap. An object is
+	 * nowhere near 2^61 bytes, so a loop that really would run that far
+	 * is out of bounds anyway and trapping up front is the right answer.
+	 */
+	if (needGuard && !StepC->isZero()) {
+		APInt Abs = StepC->getAPInt().abs();
+		uint64_t Limit = (1ULL << 61) / Abs.getZExtValue();
+		Value *Cnt = Exp.expandCodeFor(BTC, nullptr, At);
+		IRBuilder<> GB(At);
+		Value *Wide = GB.CreateZExtOrTrunc(Cnt, GB.getInt64Ty());
+		Value *Bad = GB.CreateICmpUGT(Wide, GB.getInt64(Limit));
+		DomTreeUpdater DTU(&DT, DomTreeUpdater::UpdateStrategy::Eager);
+		Instruction *T = SplitBlockAndInsertIfThen(
+			Bad, At->getIterator(), true, nullptr, &DTU, &LI);
+		IRBuilder<> FB(T);
+		FB.CreateCall(getFailFn(*CI->getModule()));
+		Guarded = true;
+	}
+
 	Type *PtrTy = P->getType();
 	Value *LoV = Exp.expandCodeFor(Lo, PtrTy, At);
 	Value *HiV = Exp.expandCodeFor(Hi, PtrTy, At);
 
 	IRBuilder<> B(At);
-	B.CreateCall(getSpanFn(*CI->getModule()), {Base, LoV, HiV, N});
+	if (Size)
+		B.CreateCall(getSpanKnownFn(*CI->getModule()), {Base, LoV, HiV, N, Size});
+	else
+		B.CreateCall(getSpanFn(*CI->getModule()), {Base, LoV, HiV, N});
 	CI->eraseFromParent();
 	return true;
 }
@@ -180,6 +227,7 @@ PreservedAnalyses jacc::LoopWidenPass::run(Function &F, FunctionAnalysisManager 
 	auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
 	const DataLayout &DL = F.getParent()->getDataLayout();
 	unsigned hoisted = 0, seen = 0;
+	bool guarded = false;
 
 	// preorder reversed: inner loops before the loops around them
 	auto loops = LI.getLoopsInPreorder();
@@ -194,22 +242,24 @@ PreservedAnalyses jacc::LoopWidenPass::run(Function &F, FunctionAnalysisManager 
 				continue;
 			for (Instruction &I : *BB)
 				if (auto *CI = dyn_cast<CallInst>(&I))
-					if (isCheck(CI))
+					if (checkKind(CI))
 						checks.push_back(CI);
 		}
 		for (CallInst *CI : checks) {
 			seen++;
-			if (widen(CI, L, SE, DT, DL))
+			if (widen(CI, L, SE, DT, LI, DL, guarded))
 				hoisted++;
 		}
 	}
 
-	if (Verbose && seen)
+	if (verbose() && seen)
 		errs() << "jacc: " << F.getName() << ": hoisted " << hoisted
 		       << " of " << seen << " loop checks\n";
 	if (!hoisted)
 		return PreservedAnalyses::all();
 
+	if (guarded)
+		return PreservedAnalyses::none();
 	PreservedAnalyses PA;
 	PA.preserveSet<CFGAnalyses>();
 	return PA;

@@ -9,17 +9,17 @@ $CC -S -emit-llvm tests/loops.c -o /tmp/jacc_loops.ll
 per_fn() { awk -v f="$1" '$0 ~ "^define.* @"f"\\(" {p=1} p{print} p&&/^}/{exit}' /tmp/jacc_loops.ll; }
 
 span=$(per_fn sum | grep -c '__jacc_check_span' || true)
-chk=$(per_fn sum | grep -c 'call void @__jacc_check(' || true)
-echo "sum: span=$span per-iter=$chk"
+chk=$(per_fn sum | grep -c '__jacc_fail' || true)
+echo "sum: span=$span left-in-fn=$chk"
 [ "$span" -ge 1 ] && [ "$chk" -eq 0 ]
 
 span=$(per_fn fill_down | grep -c '__jacc_check_span' || true)
-chk=$(per_fn fill_down | grep -c 'call void @__jacc_check(' || true)
-echo "fill_down: span=$span per-iter=$chk"
+chk=$(per_fn fill_down | grep -c '__jacc_fail' || true)
+echo "fill_down: span=$span left-in-fn=$chk"
 [ "$span" -ge 1 ] && [ "$chk" -eq 0 ]
 
-chk=$(per_fn gather | grep -c 'call void @__jacc_check(' || true)
-echo "gather: per-iter=$chk (must stay > 0)"
+chk=$(per_fn gather | grep -c '__jacc_fail' || true)
+echo "gather: left-in-fn=$chk (must stay > 0)"
 [ "$chk" -gt 0 ]
 
 # end to end: in-bounds runs, a loop that runs well past the object traps

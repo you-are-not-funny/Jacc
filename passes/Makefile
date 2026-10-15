@@ -6,7 +6,7 @@ CXXFLAGS ?= -O2 -g -Wall -fno-rtti -fPIC -std=c++17
 CXXFLAGS += $(shell $(LLVM)/bin/llvm-config --cxxflags | sed 's/-fno-exceptions//;s/-std=[^ ]*//;s/-O[0-9s]//;s/-g //')
 LDFLAGS  += $(shell $(LLVM)/bin/llvm-config --ldflags)
 
-OBJS = Instrument.o LoopWiden.o Plugin.o
+OBJS = Instrument.o LoopWiden.o LowerChecks.o Plugin.o
 
 all: libJacc.so
 

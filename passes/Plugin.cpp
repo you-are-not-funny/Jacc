@@ -15,6 +15,10 @@ static void hook(PassBuilder &PB)
 				FPM.addPass(jacc::InstrumentPass());
 				return true;
 			}
+			if (Name == "jacc-lower") {
+				FPM.addPass(jacc::LowerChecksPass());
+				return true;
+			}
 			if (Name == "jacc-widen") {
 				FPM.addPass(jacc::LoopWidenPass());
 				return true;
@@ -36,6 +40,13 @@ static void hook(PassBuilder &PB)
 			// without a dedicated preheader; make one
 			FPM.addPass(LoopSimplifyPass());
 			FPM.addPass(jacc::LoopWidenPass());
+		});
+
+	// after the vectorizer: checks that are left become cmp + cold branch
+	PB.registerOptimizerLastEPCallback(
+		[](ModulePassManager &MPM, OptimizationLevel) {
+			MPM.addPass(createModuleToFunctionPassAdaptor(
+				jacc::LowerChecksPass()));
 		});
 }
 
