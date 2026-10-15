@@ -144,11 +144,15 @@ ASan at -O0 and -O3; translation validation for the custom passes.
 
 | Piece | State |
 |---|---|
-| Low-fat check, allocator, quarantine without reuse | done, tested |
-| Check insertion with constant-offset stack/global elision | done, tested |
-| Loop range check hoisting | done, tested on simple loops |
-| Clang fork, stack handling, libc wrappers | not started |
+| Low-fat check, allocator, quarantine without reuse, malloc replacement | done, tested |
+| Exact bounds for stack, globals, VLAs | done, tested |
+| memcpy/memset/strcpy/strcat/struct-copy checks | done, tested |
+| Loop range check hoisting (with trip-count guard under -fwrapv) | done, tested on simple loops |
+| Inline check lowering with per-loop bounds hoisting | done |
+| UB policy through clang flags (wrap, zero-init, no strict aliasing) | done, tested |
+| Driver (`bin/jacc`) | done |
+| Microbenchmarks | 4 kernels only |
+| Clang fork, libc contracts, sub-object bounds | not started |
 | Sweeper and ownership inference | not started |
-| Integer policy, zero-init | not started |
 | Tag-bit (TBI/LAM) fast path, MTE | not started |
-| Benchmarks | not started |
+| SPEC-scale benchmarks | not started |
