@@ -1,0 +1,54 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# jacc: a clang wrapper that builds C with bounds checks and defined
+# behaviour for what C leaves undefined. Takes clang's options.
+#
+#   jacc [-fjacc-int=wrap|trap] [clang options] file.c ...
+#
+# Environment: JACC_CC picks the clang to use.
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+plugin=$root/passes/libJacc.so
+rt=$root/libjalloc.a
+
+if [ ! -f "$plugin" ] || [ ! -f "$rt" ]; then
+	echo "jacc: not built, run 'make' in $root" >&2
+	exit 2
+fi
+
+cc=${JACC_CC:-$(command -v clang-18 || command -v clang)}
+[ -n "$cc" ] || { echo "jacc: no clang found, set JACC_CC" >&2; exit 2; }
+
+link=1
+int=wrap
+n=$#
+while [ $n -gt 0 ]; do
+	a=$1
+	shift
+	n=$((n - 1))
+	case $a in
+	-c|-S|-E|-M|-MM)	link=0 ;;
+	-fjacc-int=*)		int=${a#-fjacc-int=}; continue ;;
+	esac
+	set -- "$@" "$a"
+done
+
+case $int in
+wrap)	intflags="-fwrapv" ;;
+trap)	intflags="-fsanitize=signed-integer-overflow -fsanitize-trap=signed-integer-overflow" ;;
+*)	echo "jacc: -fjacc-int= takes wrap or trap" >&2; exit 2 ;;
+esac
+
+# What each flag does:
+#  -fwrapv                            signed overflow wraps
+#  -fno-strict-aliasing               type punning means what you wrote
+#  -fno-delete-null-pointer-checks    a deref doesn't prove non-null
+#  -ftrivial-auto-var-init=zero       locals start as zero
+set -- $intflags -fno-strict-aliasing -fno-delete-null-pointer-checks \
+	-ftrivial-auto-var-init=zero -fpass-plugin="$plugin" "$@"
+
+if [ $link -eq 1 ]; then
+	exec "$cc" "$@" "$rt" -lpthread
+fi
+exec "$cc" "$@"
