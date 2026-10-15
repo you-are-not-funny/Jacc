@@ -133,27 +133,10 @@ static void *big_alloc(size_t n)
 	return m + PAGE;
 }
 
-void *jalloc_malloc(size_t n)
+static void *alloc_class(int c)
 {
-	size_t need = n + 1;	/* one past the end must stay inside the slot */
-	struct region *r;
+	struct region *r = &reg[c];
 	char *p;
-	int c;
-
-	pthread_once(&once, do_init);
-	if (init_failed) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	if (need < n) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	if (need > MAX_CLASS)
-		return big_alloc(n);
-
-	c = class_for(need);
-	r = &reg[c];
 
 	pthread_mutex_lock(&r->lock);
 	p = r->bump;
@@ -177,6 +160,51 @@ void *jalloc_malloc(size_t n)
 	r->state[(size_t)(p - r->base) / lf_size[c]] = SLOT_LIVE;
 	pthread_mutex_unlock(&r->lock);
 	return p;	/* fresh pages are zero and slots are never reused */
+}
+
+void *jalloc_malloc(size_t n)
+{
+	size_t need = n + 1;	/* one past the end must stay inside the slot */
+
+	pthread_once(&once, do_init);
+	if (init_failed || need < n) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	if (need > MAX_CLASS)
+		return big_alloc(n);
+	return alloc_class(class_for(need));
+}
+
+/* align must be a power of two; slot k starts at k*size, so any class
+ * whose size is a multiple of align gives aligned pointers */
+void *jalloc_memalign(size_t align, size_t n)
+{
+	size_t need = n + 1;
+	int c;
+
+	if (align <= 16)
+		return jalloc_malloc(n);
+	if (align & (align - 1)) {
+		errno = EINVAL;
+		return NULL;
+	}
+	pthread_once(&once, do_init);
+	if (init_failed || need < n) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	if (need <= MAX_CLASS) {
+		c = class_for(need);
+		while (c < nclass && lf_size[c] % align)
+			c++;
+		if (c < nclass)
+			return alloc_class(c);
+	}
+	if (align <= PAGE)
+		return big_alloc(n);
+	errno = ENOMEM;
+	return NULL;
 }
 
 void *jalloc_calloc(size_t n, size_t sz)
@@ -263,9 +291,20 @@ void *jalloc_realloc(void *p, size_t n)
 	return q;
 }
 
+void __jacc_fail(void)
+{
+	jacc_trap("out-of-bounds access");
+}
+
 void __jacc_check(const void *base, const void *p, size_t n)
 {
 	if (!lf_check(base, p, n))
+		jacc_trap("out-of-bounds access");
+}
+
+void __jacc_check_known(const void *base, const void *p, size_t n, size_t size)
+{
+	if (!lf_check_known(base, p, n, size))
 		jacc_trap("out-of-bounds access");
 }
 
@@ -274,4 +313,34 @@ void __jacc_check_span(const void *base, const void *lo, const void *hi,
 {
 	if (!lf_check_span(base, lo, hi, n))
 		jacc_trap("out-of-bounds access (loop range)");
+}
+
+void __jacc_check_span_known(const void *base, const void *lo, const void *hi,
+			     size_t n, size_t size)
+{
+	if ((uint64_t)hi < (uint64_t)lo ||
+	    !lf_check_known(base, lo, n, size) ||
+	    !lf_check_known(base, hi, n, size))
+		jacc_trap("out-of-bounds access (loop range)");
+}
+
+/* size != 0: the compiler knew the object's size. Otherwise it's a
+ * heap pointer (or foreign) and the address has to say. */
+static int fits(const void *base, const char *p, size_t n, size_t size)
+{
+	return size ? lf_check_known(base, p, n, size) : lf_check(base, p, n);
+}
+
+void __jacc_check_strcpy(const void *base, const char *dst, const char *src,
+			 size_t size)
+{
+	if (!fits(base, dst, strlen(src) + 1, size))
+		jacc_trap("strcpy overflows destination");
+}
+
+void __jacc_check_strcat(const void *base, const char *dst, const char *src,
+			 size_t size)
+{
+	if (!fits(base, dst, strlen(dst) + strlen(src) + 1, size))
+		jacc_trap("strcat overflows destination");
 }

@@ -56,6 +56,15 @@ static inline int lf_check(const void *base, const void *p, size_t n)
 	return d <= size && n <= size - d;
 }
 
+/* object whose size the compiler knows (stack, globals) */
+static inline int lf_check_known(const void *base, const void *p, size_t n,
+				 size_t size)
+{
+	uint64_t d = (uint64_t)p - (uint64_t)base;
+
+	return d <= size && n <= size - d;
+}
+
 /* lo <= hi, both accesses of n bytes in bounds of base's slot */
 static inline int lf_check_span(const void *base, const void *lo,
 				const void *hi, size_t n)
