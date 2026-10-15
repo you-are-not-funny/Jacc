@@ -4,38 +4,77 @@ Just Another C Compiler. A memory-safe C front for LLVM that keeps the C
 ABI: same pointer size, same struct layout, same calling convention, so
 it links against objects built by GCC and Clang.
 
-**Status: early prototype.** What exists today is the runtime allocator,
-the bounds check, and two LLVM passes. It is not a compiler you can
-build a system with yet. The goal and the plan are in `docs/SPEC.md`;
-the overhead numbers there are targets, not measurements.
+**Status: early prototype.** `bin/jacc` works as a drop-in front for
+clang on small C programs: it adds bounds checks, defines the UB listed
+below, and replaces malloc. It has not been run on real-world code bases
+yet, so expect things to break. The plan is in `docs/SPEC.md`.
 
-## What works now
+## What you get
 
-| Piece | Where | Tested |
-|---|---|---|
-| Size-class allocator, double free and interior free trap, no address reuse | `runtime/jalloc.c` | `tests/runtime_test.c` |
-| Bounds derived from the pointer value, no fat pointers | `runtime/lowfat.h` | same |
-| Pass that inserts a check before loads/stores it can't prove safe | `passes/Instrument.cpp` | `passes/check.sh` |
-| Pass that turns a per-iteration check into one range check before the loop | `passes/LoopWiden.cpp` | same |
+Compile with `bin/jacc` the way you would with clang (`-O2`, `-c`, `-o`,
+`-I` and so on all pass through):
 
-Not done: the Clang frontend fork, stack object handling, the sweeper
-that recycles freed memory, libc wrappers, integer overflow policy,
-zero-init of locals, vectorizer integration. See the table at the end of
-`docs/SPEC.md`.
+- **Heap overruns trap.** malloc, calloc, realloc and friends are
+  replaced process-wide, libraries included. Bounds come from the
+  address; pointers stay 8 bytes.
+- **Stack and global arrays are checked with exact sizes**, including
+  VLAs.
+- **`memcpy`, `memmove`, `memset`, `strncpy`, `strcpy`, `strcat` and
+  struct copies are checked.**
+- **Double free and free of a non-start pointer trap.** Freed memory is
+  poisoned and its address never reused, so a stale pointer can't see a
+  new object.
+- **UB is defined:** signed overflow wraps (`-fjacc-int=trap` makes it
+  trap), locals start at zero, strict aliasing is off, and a dereference
+  doesn't let the optimizer assume non-null.
+- **Loop checks are hoisted:** a loop over `a[i]` gets one range check
+  before it instead of one per iteration, so it can still vectorize.
 
-## Known limits of what's here
+Tested by `make check`: the allocator, the passes on small loops, and 20
+end-to-end programs at `-O0` and `-O2` (overruns trap, ordinary programs
+using stdio, qsort and realloc keep working).
 
-- Bounds are the size *class*, not the size you asked for. `malloc(80)`
-  lands in a 96-byte slot, so a write to byte 90 is not caught. Exact
-  sizes need a side table; that's planned, not built.
-- Freed addresses are never reused, so a use-after-free can't hit a new
-  object. The price is address space: each size class has 32 GiB.
+## Speed
+
+One microbenchmark file (`bench/micro.c`), Linux x86-64, vs plain
+`clang -O2` with glibc malloc, three runs:
+
+| Kernel | Slowdown |
+|---|---|
+| streaming `y[i] += a*x[i]` | 1.0x |
+| 400x400 matrix multiply | 1.0-1.3x |
+| random gather `tab[idx[i]]` | 1.0-1.4x |
+| malloc/free linked list | 2.3-3.0x |
+
+This is four small kernels, not SPEC, and the run-to-run noise is big.
+The list case is slow because freed memory is never recycled (more page
+faults) and malloc takes a lock. The goal in the spec is single digits
+percent on real code; nothing here shows that yet.
+
+## Not done
+
+Clang fork (we wrap clang instead), the sweeper that recycles freed
+memory, libc checks beyond the string and mem functions above,
+sub-object bounds, tag-bit hardware paths, checking of foreign code,
+and everything in the last table of `docs/SPEC.md`.
+
+## Known limits
+
+- Heap bounds are the size *class*, not the size you asked for.
+  `malloc(80)` gets a 96-byte slot, so a write to byte 90 isn't caught.
+  Stack and global bounds are exact.
+- Memory from anywhere but this allocator (mmap, a library's own pool)
+  passes every check.
 - Allocations over 16 MiB get their own mapping and are not checked.
-- The loop pass assumes an inbounds GEP that wraps is undefined, which is
-  what LLVM assumes too. A hoisted check can trap earlier than the
-  original access would have. `-jacc-precise-traps` stops hoisting past
-  calls.
-- Tested on Linux x86-64 with LLVM 18 only.
+- Freed addresses are never reused; each size class has 32 GiB.
+- With `-fwrapv`, clang stops marking GEPs inbounds, so loop hoisting
+  adds a trip-count guard; loops whose index needs int wraparound to
+  analyze may keep their per-iteration check.
+- LLVM may delete a malloc/free pair whose memory is never used, along
+  with a double free on it.
+- A hoisted check can trap earlier than the access would have.
+  `-jacc-precise-traps` (set through `-mllvm`) stops hoisting past calls.
+- Tested on Linux x86-64 with LLVM 18 only. Not a security boundary.
 
 ## Build
 
@@ -43,14 +82,13 @@ Needs gcc or clang, make, and LLVM 18 dev packages
 (`apt install llvm-18-dev clang-18`).
 
     make            # libjalloc.a and passes/libJacc.so
-    make check      # runtime tests, then the pass tests
+    make check      # all tests
 
-Use the passes with stock clang:
+    bin/jacc -O2 -o prog prog.c
+    bin/jacc -fjacc-int=trap -O2 -o prog prog.c    # overflow traps
+    JACC_VERBOSE=1 bin/jacc -O2 -c prog.c          # why checks stay
 
-    clang-18 -O2 -fpass-plugin=passes/libJacc.so prog.c libjalloc.a -lpthread
-
-Allocate with `jalloc_malloc` and friends. Pointers from the system
-`malloc` are not in a checked region and pass every check unexamined.
+Set `JACC_CC` to pick a different clang.
 
 ## License
 
